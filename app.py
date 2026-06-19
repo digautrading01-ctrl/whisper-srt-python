@@ -36,6 +36,9 @@ app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY", "dev-secret-change
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH_MB * 1024 * 1024
 
 
+FINISHED_JOB_TTL_SECONDS = int(os.environ.get("FINISHED_JOB_TTL_SECONDS", "3600"))
+
+
 @dataclass
 class TranscriptionJob:
     job_id: str
@@ -48,6 +51,7 @@ class TranscriptionJob:
     output_path: str | None = None
     download_name: str | None = None
     eta_seconds: int | None = None
+    finished_at: float | None = None
 
 
 def find_model_path() -> str:
@@ -111,8 +115,6 @@ def resolve_device_attempts() -> list[tuple[str, str]]:
         return attempts
 
     if detect_nvidia_gpu():
-        add_attempt("cuda", requested_compute or "float16")
-    else:
         add_attempt("cuda", requested_compute or "float16")
     add_attempt("cpu", "int8")
     return attempts
@@ -227,8 +229,24 @@ def get_job(job_id: str) -> TranscriptionJob | None:
         return JOBS.get(job_id)
 
 
+_TERMINAL_STATUSES = {"complete", "error", "cancelled"}
+
+
+def _cleanup_finished_jobs() -> None:
+    """Remove terminal jobs that finished more than FINISHED_JOB_TTL_SECONDS ago."""
+    cutoff = time.time() - FINISHED_JOB_TTL_SECONDS
+    with JOBS_LOCK:
+        to_remove = [
+            jid for jid, job in JOBS.items()
+            if job.finished_at is not None and job.finished_at < cutoff
+        ]
+        for jid in to_remove:
+            del JOBS[jid]
+
+
 def job_payload(job: TranscriptionJob) -> dict:
     payload = asdict(job)
+    payload.pop("finished_at", None)
     payload["progress"] = round(job.progress, 1)
     payload["pause_url"] = url_for("pause_job", job_id=job.job_id)
     payload["resume_url"] = url_for("resume_job", job_id=job.job_id)
@@ -256,6 +274,8 @@ def update_job(
             return
         if status is not None:
             job.status = status
+            if status in _TERMINAL_STATUSES and job.finished_at is None:
+                job.finished_at = time.time()
         if stage is not None:
             job.stage = stage
         if detail is not None:
@@ -572,6 +592,7 @@ def index():
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
     ensure_dirs()
+    _cleanup_finished_jobs()
 
     if "audio" not in request.files:
         return error_out("No file uploaded.")

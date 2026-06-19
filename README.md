@@ -86,8 +86,10 @@ http://127.0.0.1:5000
 - Output writing is done via a temporary file + atomic rename to avoid corrupted `.srt` files.
 - You can configure the Whisper model size (used as fallback when no local model is found) via environment variable:
   - `WHISPER_MODEL=base` (default, other options: tiny, tiny.en, base.en, small, small.en, medium, medium.en, large, large-v2, large-v3, distil-large-v2, distil-large-v3)
-- By default the app uses `WHISPER_DEVICE=auto`, which tries CUDA first and automatically falls back to CPU if CUDA is unavailable or model initialization fails.
+- By default the app uses `WHISPER_DEVICE=auto`, which tries CUDA first (only when an NVIDIA GPU is detected) and automatically falls back to CPU if CUDA is unavailable or model initialization fails.
 - You can still configure the runtime manually:
   - `WHISPER_DEVICE=auto` (default), `cpu`, or `cuda`
   - `WHISPER_COMPUTE_TYPE=auto` (default) for device-specific defaults, or set an explicit value such as `int8`, `float32`, or `float16`
 - The `/healthz` endpoint now reports the active runtime device and compute type.
+- Completed, cancelled, and failed jobs are kept in memory for 1 hour, then automatically removed on the next upload. Download links stop working once the job is purged. You can adjust the retention window via:
+  - `FINISHED_JOB_TTL_SECONDS=3600` (default)
