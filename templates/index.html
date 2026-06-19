@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Offline Speech-to-Text (Whisper → SRT)</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+  <body>
+    <main class="container">
+      <div class="title-row">
+        <h1>Offline Speech-to-Text</h1>
+        <span class="runtime-badge runtime-{{ runtime_device|lower }}" title="Active Whisper runtime">
+          {{ runtime_device }}
+        </span>
+      </div>
+      <p class="subtitle">Upload an audio file and download the generated <code>.srt</code> subtitles.</p>
+
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          <div class="messages">
+            {% for category, message in messages %}
+              <div class="message {{ category }}">{{ message }}</div>
+            {% endfor %}
+          </div>
+        {% endif %}
+      {% endwith %}
+
+      <form class="card" action="{{ url_for('transcribe') }}" method="post" enctype="multipart/form-data">
+        <label for="audio">Audio file</label>
+        <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Drag and drop an audio file, or click to browse">
+          <div class="dropzone-title">Drag &amp; drop your audio here</div>
+          <div class="dropzone-subtitle">or click to choose a file</div>
+          <div id="filemeta" class="dropzone-meta" aria-live="polite"></div>
+        </div>
+        <input id="audio" name="audio" class="file-input" type="file" accept=".mp3,.wav,.m4a,.flac,.ogg,.webm,audio/*" required />
+
+        <div id="status" class="status" hidden>
+          <div id="statusText" class="status-text">Uploading…</div>
+          <div id="progressWrap" class="progress">
+            <div id="progressBar" class="progress-bar" style="width: 0%"></div>
+          </div>
+          <div id="statusDetail" class="status-detail" aria-live="polite"></div>
+        </div>
+
+        <div id="jobControls" class="job-controls" hidden>
+          <button id="pauseBtn" type="button" class="secondary">Pause</button>
+          <button id="resumeBtn" type="button" class="secondary" hidden>Resume</button>
+          <button id="cancelBtn" type="button" class="danger">Cancel</button>
+        </div>
+
+        <button type="submit">Generate SRT</button>
+      </form>
+
+      <details class="help">
+        <summary>Troubleshooting</summary>
+        <ul>
+          <li>Supported formats: MP3, WAV, M4A, FLAC, OGG, WebM.</li>
+          <li>This app requires <code>ffmpeg</code> installed and available in your PATH.</li>
+          <li>The Whisper model will be downloaded automatically on first run.</li>
+        </ul>
+      </details>
+    </main>
+
+    <script>
+      (function () {
+        const dropzone = document.getElementById("dropzone");
+        const input = document.getElementById("audio");
+        const filemeta = document.getElementById("filemeta");
+        const form = input.closest("form");
+        const submitBtn = form.querySelector('button[type="submit"]');
+        const status = document.getElementById("status");
+        const statusText = document.getElementById("statusText");
+        const statusDetail = document.getElementById("statusDetail");
+        const progressWrap = document.getElementById("progressWrap");
+        const progressBar = document.getElementById("progressBar");
+        const jobControls = document.getElementById("jobControls");
+        const pauseBtn = document.getElementById("pauseBtn");
+        const resumeBtn = document.getElementById("resumeBtn");
+        const cancelBtn = document.getElementById("cancelBtn");
+        let activePoll = null;
+        let activeJob = null;
+
+        const ALLOWED_EXTS = [".mp3", ".wav", ".m4a", ".flac", ".ogg", ".webm"];
+
+        function isAllowed(file) {
+          const name = (file && file.name) ? file.name.toLowerCase() : "";
+          return ALLOWED_EXTS.some(ext => name.endsWith(ext));
+        }
+
+        function setMeta(text, isError) {
+          filemeta.textContent = text || "";
+          filemeta.classList.toggle("error", !!isError);
+        }
+
+        function showStatus(kind, text, detail) {
+          status.hidden = false;
+          status.classList.remove("error", "success", "cancelled");
+          if (kind) status.classList.add(kind);
+          statusText.textContent = text || "";
+          statusDetail.textContent = detail || "";
+        }
+
+        function setProgress(pct) {
+          progressWrap.classList.remove("indeterminate");
+          const v = Math.max(0, Math.min(100, pct));
+          progressBar.style.width = v.toFixed(1) + "%";
+        }
+
+        function setFile(file) {
+          if (!file) return;
+          if (!isAllowed(file)) {
+            setMeta("Unsupported format. Please use MP3, WAV, M4A, FLAC, OGG, or WebM.", true);
+            input.value = "";
+            return;
+          }
+          const dt = new DataTransfer();
+          dt.items.add(file);
+          input.files = dt.files;
+          setMeta(`Selected: ${file.name} (${Math.round(file.size / 1024 / 1024)} MB)`, false);
+        }
+
+        dropzone.addEventListener("click", () => input.click());
+        dropzone.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") input.click();
+        });
+
+        input.addEventListener("change", () => {
+          const file = input.files && input.files[0];
+          if (file) setFile(file);
+        });
+
+        ["dragenter", "dragover"].forEach((evt) => {
+          dropzone.addEventListener(evt, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropzone.classList.add("dragover");
+          });
+        });
+        ["dragleave", "drop"].forEach((evt) => {
+          dropzone.addEventListener(evt, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropzone.classList.remove("dragover");
+          });
+        });
+
+        dropzone.addEventListener("drop", (e) => {
+          const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+          setFile(file);
+        });
+
+        function getFilenameFromContentDisposition(headerValue, fallbackName) {
+          if (!headerValue) return fallbackName;
+          const utf8Match = headerValue.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+          if (utf8Match && utf8Match[1]) return decodeURIComponent(utf8Match[1].replace(/"/g, ""));
+          const match = headerValue.match(/filename\s*=\s*"?([^"]+)"?/i);
+          if (match && match[1]) return match[1];
+          return fallbackName;
+        }
+
+        function downloadBlob(blob, filename) {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = filename || "subtitles.srt";
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+
+        function triggerDownload(url) {
+          const a = document.createElement("a");
+          a.href = url;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+        }
+
+        function blobToText(blob) {
+          return new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result || ""));
+            reader.onerror = () => resolve("");
+            reader.readAsText(blob);
+          });
+        }
+
+        function stopPolling() {
+          if (activePoll) {
+            clearInterval(activePoll);
+            activePoll = null;
+          }
+        }
+
+        function showControls() {
+          jobControls.hidden = false;
+        }
+
+        function hideControls() {
+          jobControls.hidden = true;
+          resumeBtn.hidden = true;
+          pauseBtn.hidden = false;
+          pauseBtn.disabled = false;
+          resumeBtn.disabled = false;
+          cancelBtn.disabled = false;
+          activeJob = null;
+        }
+
+        function updateControlsFromJob(job) {
+          if (!job) return;
+          const st = String(job.status || "");
+          if (st === "running") {
+            showControls();
+            pauseBtn.hidden = false;
+            resumeBtn.hidden = true;
+            pauseBtn.disabled = false;
+            resumeBtn.disabled = true;
+            cancelBtn.disabled = false;
+            return;
+          }
+          if (st === "paused") {
+            showControls();
+            pauseBtn.hidden = true;
+            resumeBtn.hidden = false;
+            resumeBtn.disabled = false;
+            cancelBtn.disabled = false;
+            return;
+          }
+          if (st === "cancelling") {
+            showControls();
+            pauseBtn.disabled = true;
+            resumeBtn.disabled = true;
+            cancelBtn.disabled = true;
+            return;
+          }
+          // complete / error / cancelled / unknown
+          hideControls();
+        }
+
+        async function postJobAction(url) {
+          const res = await fetch(url, {
+            method: "POST",
+            headers: { "X-Requested-With": "XMLHttpRequest" },
+            cache: "no-store",
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || "Request failed.");
+          return data;
+        }
+
+        pauseBtn.addEventListener("click", async () => {
+          if (!activeJob || !activeJob.pauseUrl) return;
+          pauseBtn.disabled = true;
+          try {
+            await postJobAction(activeJob.pauseUrl);
+          } catch (err) {
+            showStatus("error", "Failed.", err && err.message ? err.message : "Unable to pause the job.");
+          } finally {
+            pauseBtn.disabled = false;
+          }
+        });
+
+        resumeBtn.addEventListener("click", async () => {
+          if (!activeJob || !activeJob.resumeUrl) return;
+          resumeBtn.disabled = true;
+          try {
+            await postJobAction(activeJob.resumeUrl);
+          } catch (err) {
+            showStatus("error", "Failed.", err && err.message ? err.message : "Unable to resume the job.");
+          } finally {
+            resumeBtn.disabled = false;
+          }
+        });
+
+        cancelBtn.addEventListener("click", async () => {
+          if (!activeJob || !activeJob.cancelUrl) return;
+          cancelBtn.disabled = true;
+          try {
+            await postJobAction(activeJob.cancelUrl);
+          } catch (err) {
+            showStatus("error", "Failed.", err && err.message ? err.message : "Unable to cancel the job.");
+          }
+        });
+
+        async function pollJob(statusUrl, downloadUrl) {
+          try {
+            const res = await fetch(statusUrl, { cache: "no-store" });
+            const data = await res.json();
+            if (!res.ok) {
+              throw new Error(data.error || "Unable to get job status.");
+            }
+
+            // Track control endpoints from server (in case we didn't start this job in this tab).
+            if (!activeJob) {
+              activeJob = {
+                statusUrl,
+                pauseUrl: data.pause_url,
+                resumeUrl: data.resume_url,
+                cancelUrl: data.cancel_url,
+              };
+            }
+            updateControlsFromJob(data);
+
+            const progress = Number.isFinite(data.progress) ? data.progress : 0;
+            setProgress(progress);
+
+            if (data.status === "complete") {
+              stopPolling();
+              showStatus("success", "Done.", data.detail || "Download starting.");
+              submitBtn.disabled = false;
+              submitBtn.textContent = "Generate SRT";
+              hideControls();
+              triggerDownload(data.download_url || downloadUrl);
+              return;
+            }
+
+            if (data.status === "error") {
+              stopPolling();
+              showStatus("error", data.stage || "Failed.", data.error || data.detail || "Transcription failed.");
+              submitBtn.disabled = false;
+              submitBtn.textContent = "Generate SRT";
+              hideControls();
+              return;
+            }
+
+            if (data.status === "cancelled") {
+              stopPolling();
+              showStatus("cancelled", "Cancelled.", data.detail || "Cancelled by user.");
+              submitBtn.disabled = false;
+              submitBtn.textContent = "Generate SRT";
+              hideControls();
+              return;
+            }
+
+            const stage = data.stage || "Transcribing";
+            const detail = data.detail || `${Math.round(progress)}%`;
+            showStatus(null, `${stage} (${Math.round(progress)}%)`, detail);
+          } catch (err) {
+            stopPolling();
+            showStatus("error", "Failed.", err && err.message ? err.message : "Unable to track transcription progress.");
+            submitBtn.disabled = false;
+            submitBtn.textContent = "Generate SRT";
+            hideControls();
+          }
+        }
+
+        form.addEventListener("submit", async (e) => {
+          e.preventDefault();
+          const file = input.files && input.files[0];
+          if (!file) {
+            setMeta("Please choose a file first.", true);
+            return;
+          }
+          if (!isAllowed(file)) {
+            setMeta("Unsupported format. Please use MP3, WAV, M4A, FLAC, OGG, or WebM.", true);
+            return;
+          }
+
+          // UI state
+          submitBtn.disabled = true;
+          submitBtn.textContent = "Processing…";
+          stopPolling();
+          hideControls();
+          showStatus(null, "Uploading…", "");
+          setProgress(0);
+
+          const fd = new FormData();
+          fd.append("audio", file, file.name);
+
+          const xhr = new XMLHttpRequest();
+          xhr.open("POST", form.action, true);
+          xhr.responseType = "blob";
+          xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
+
+          xhr.upload.onprogress = (evt) => {
+            if (evt.lengthComputable) {
+              const pct = (evt.loaded / evt.total) * 100;
+              setProgress(pct);
+              showStatus(null, "Uploading…", `${Math.round(pct)}%`);
+            } else {
+              showStatus(null, "Uploading…", "");
+            }
+          };
+          xhr.upload.onloadend = () => {
+            showStatus(null, "Starting transcription…", "Upload complete. Preparing audio.");
+            setProgress(0);
+          };
+
+          xhr.onload = async () => {
+            try {
+              const contentType = (xhr.getResponseHeader("Content-Type") || "").toLowerCase();
+              if (xhr.status >= 200 && xhr.status < 300) {
+                if (contentType.includes("application/json")) {
+                  const text = await blobToText(xhr.response);
+                  const data = JSON.parse(text || "{}");
+                  if (!data.job_id || !data.status_url) {
+                    throw new Error("The server did not return a valid job response.");
+                  }
+                  activeJob = {
+                    id: data.job_id,
+                    statusUrl: data.status_url,
+                    pauseUrl: data.pause_url,
+                    resumeUrl: data.resume_url,
+                    cancelUrl: data.cancel_url,
+                  };
+                  updateControlsFromJob({ status: "running" });
+                  showStatus(null, "Queued (0%)", "Waiting for transcription to begin.");
+                  setProgress(0);
+                  activePoll = setInterval(() => {
+                    pollJob(data.status_url, data.download_url);
+                  }, 1000);
+                  await pollJob(data.status_url, data.download_url);
+                } else {
+                  const cd = xhr.getResponseHeader("Content-Disposition") || "";
+                  const filename = getFilenameFromContentDisposition(cd, "subtitles.srt");
+                  downloadBlob(xhr.response, filename);
+                  showStatus("success", "Done.", `Download started: ${filename}`);
+                  submitBtn.disabled = false;
+                  submitBtn.textContent = "Generate SRT";
+                  hideControls();
+                }
+              } else {
+                let msg = "Request failed.";
+                if (xhr.response) {
+                  const text = await blobToText(xhr.response);
+                  if (contentType.includes("application/json")) {
+                    try {
+                      const j = JSON.parse(text);
+                      msg = j.error || msg;
+                    } catch (_) {
+                      msg = text || msg;
+                    }
+                  } else {
+                    msg = text || msg;
+                  }
+                }
+                showStatus("error", "Failed.", msg);
+                hideControls();
+              }
+            } catch (err) {
+              showStatus("error", "Failed.", err && err.message ? err.message : "Request failed.");
+              submitBtn.disabled = false;
+              submitBtn.textContent = "Generate SRT";
+              hideControls();
+            }
+          };
+
+          xhr.onerror = () => {
+            stopPolling();
+            showStatus("error", "Failed.", "Network error. Please try again.");
+            submitBtn.disabled = false;
+            submitBtn.textContent = "Generate SRT";
+            hideControls();
+          };
+
+          xhr.send(fd);
+        });
+      })();
+    </script>
+  </body>
+</html>
